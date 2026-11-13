@@ -4,7 +4,7 @@
 const manifest = {
   "id": "mangadex",
   "name": "MangaDex",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "lang": "en",
   "baseUrl": "https://mangadex.org",
   "type": "COMIC",
@@ -145,21 +145,56 @@ const extension = {
 
   async getChapters(url) {
     const id = url.replace("https://mangadex.org/title/", "").replace("https://api.mangadex.org/manga/", "").split("/")[0];
-    const fetchUrl = `${this.apiUrl}/manga/${id}/feed?limit=100&translatedLanguage[]=en&order[chapter]=desc&includeExternalUrl=0`;
+    const ratings = "&contentRating[]=safe&contentRating[]=suggestive&contentRating[]=erotica&contentRating[]=pornographic";
+    const fetchUrlEn = `${this.apiUrl}/manga/${id}/feed?limit=500&translatedLanguage[]=en&order[chapter]=desc${ratings}`;
 
-    const res = await dokuha.fetch(fetchUrl, { headers: this._headers() });
-    const json = await res.json();
-    const chaptersData = json.data || [];
+    const resEn = await dokuha.fetch(fetchUrlEn, { headers: this._headers() });
+    const jsonEn = await resEn.json();
+    let chaptersData = jsonEn.data || [];
+
+    const hasHostedEn = chaptersData.some(ch => !ch.attributes || !ch.attributes.externalUrl);
+
+    // If no hosted English chapters, fetch all languages so the user can read hosted chapters
+    if (!hasHostedEn) {
+      const fetchUrlAll = `${this.apiUrl}/manga/${id}/feed?limit=500&order[chapter]=desc${ratings}`;
+      const resAll = await dokuha.fetch(fetchUrlAll, { headers: this._headers() });
+      const jsonAll = await resAll.json();
+      const allData = jsonAll.data || [];
+
+      const existingIds = new Set(chaptersData.map(c => c.id));
+      for (const ch of allData) {
+        if (!existingIds.has(ch.id)) {
+          chaptersData.push(ch);
+          existingIds.add(ch.id);
+        }
+      }
+    }
 
     return chaptersData.map(ch => {
       const attr = ch.attributes || {};
       const chNum = parseFloat(attr.chapter) || 0;
+      const extUrl = attr.externalUrl;
+      const lang = attr.translatedLanguage;
       const title = attr.title ? ` - ${attr.title}` : "";
-      const name = attr.chapter ? `Chapter ${attr.chapter}${title}` : (attr.title || "Oneshot");
+
+      let prefix = "";
+      if (lang && lang !== "en") {
+        prefix = `[${lang.toUpperCase()}] `;
+      }
+      if (extUrl) {
+        try {
+          const host = extUrl.split("/")[2].replace("www.", "");
+          prefix = `[${host}] ` + prefix;
+        } catch (_) {
+          prefix = `[External] ` + prefix;
+        }
+      }
+
+      const name = attr.chapter ? `${prefix}Chapter ${attr.chapter}${title}` : (attr.title ? `${prefix}${attr.title}` : `${prefix}Oneshot`);
       const dateUpload = attr.publishAt ? new Date(attr.publishAt).getTime() : 0;
 
       return {
-        url: ch.id,
+        url: extUrl || ch.id,
         name: name,
         chapterNumber: chNum,
         dateUpload: dateUpload,
@@ -169,6 +204,10 @@ const extension = {
   },
 
   async getPages(chapterUrl) {
+    if (chapterUrl.startsWith("http://") || chapterUrl.startsWith("https://")) {
+      return [];
+    }
+
     const id = chapterUrl.split("/").pop();
     const fetchUrl = `${this.apiUrl}/at-home/server/${id}`;
 
@@ -186,7 +225,11 @@ const extension = {
     return files.map((file, idx) => ({
       index: idx + 1,
       url: `${baseUrl}/data/${hash}/${file}`,
-      imageUrl: `${baseUrl}/data/${hash}/${file}`
+      imageUrl: `${baseUrl}/data/${hash}/${file}`,
+      headers: {
+        "User-Agent": "Dokuha/1.0.0 (https://github.com/RitwikGupta-0501/dokuha)",
+        "Referer": "https://mangadex.org"
+      }
     }));
   }
 };
