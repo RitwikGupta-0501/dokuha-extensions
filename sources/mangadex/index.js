@@ -4,7 +4,7 @@
 const manifest = {
   "id": "mangadex",
   "name": "MangaDex",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "lang": "en",
   "baseUrl": "https://mangadex.org",
   "type": "COMIC",
@@ -161,11 +161,14 @@ const extension = {
       const jsonAll = await resAll.json();
       const allData = jsonAll.data || [];
 
-      const existingIds = new Set(chaptersData.map(c => c.id));
-      for (const ch of allData) {
-        if (!existingIds.has(ch.id)) {
-          chaptersData.push(ch);
-          existingIds.add(ch.id);
+      const existingIds = {};
+      for (let i = 0; i < chaptersData.length; i++) {
+        existingIds[chaptersData[i].id] = true;
+      }
+      for (let i = 0; i < allData.length; i++) {
+        if (!existingIds[allData[i].id]) {
+          chaptersData.push(allData[i]);
+          existingIds[allData[i].id] = true;
         }
       }
     }
