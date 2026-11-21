@@ -10,7 +10,7 @@
 const manifest = {
   "id": "asurascans",
   "name": "Asura Scans",
-  "version": "1.2.0",
+  "version": "1.2.1",
   "lang": "en",
   "baseUrl": "https://asurascans.com",
   "type": "COMIC",
@@ -325,6 +325,48 @@ const extension = {
   async getDetails(url) {
     const clean = cleanSlug(url);
     const resolvedSlug = getCachedSlug(clean);
+
+    // 1. Primary: Fast JSON REST API (avoids Cloudflare WAF entirely)
+    try {
+      const apiUrl = `${this.apiUrl}/series/${resolvedSlug}`;
+      const apiRes = await this._fetch(apiUrl);
+      if (apiRes.ok) {
+        const json = await apiRes.json();
+        const s = (json && (json.series || json.data)) || json;
+        if (s && (s.title || s.slug)) {
+          if (s.public_url) {
+            setCachedSlug(clean, s.public_url);
+          }
+          const genres = [];
+          if (s.type) {
+            genres.push(s.type.charAt(0).toUpperCase() + s.type.slice(1));
+          }
+          if (Array.isArray(s.genres)) {
+            s.genres.forEach(g => {
+              const name = typeof g === 'object' && g !== null ? (g.name || g.slug) : String(g);
+              if (name) genres.push(name);
+            });
+          }
+          const desc = s.description
+            ? decodeHtmlEntities(s.description).replace(/<[^>]*>/g, "").trim()
+            : "";
+          const returnUrl = s.public_url || `/comics/${s.slug || resolvedSlug}`;
+          return {
+            url: returnUrl.startsWith("/") ? returnUrl : `/${returnUrl}`,
+            title: s.title || "Untitled",
+            thumbnailUrl: s.cover || s.cover_url || s.coverUrl || "",
+            author: s.author || "",
+            artist: s.artist || "",
+            description: desc,
+            genres: genres,
+            status: mapStatus(s.status),
+            isNovel: false
+          };
+        }
+      }
+    } catch (_) {}
+
+    // 2. Secondary fallback: HTML scraping (Keiyoushi parity)
     let targetUrl = url.startsWith("http")
       ? url
       : `${this.baseUrl}/comics/${resolvedSlug}`;
@@ -427,6 +469,56 @@ const extension = {
   async getChapters(url, options = {}) {
     const clean = cleanSlug(url);
     const resolvedSlug = getCachedSlug(clean);
+    const now = Date.now();
+    const hidePremium = Boolean(options && (options.hidePremium || options.pref_hide_premium_chapters));
+
+    // 1. Primary: Fast JSON REST API (avoids Cloudflare WAF entirely)
+    try {
+      const apiUrl = `${this.apiUrl}/series/${resolvedSlug}/chapters`;
+      const apiRes = await this._fetch(apiUrl);
+      if (apiRes.ok) {
+        const json = await apiRes.json();
+        const rawChapters = (json && json.data && Array.isArray(json.data)) ? json.data : [];
+        if (rawChapters.length > 0) {
+          const chapters = [];
+          for (const ch of rawChapters) {
+            const isPremium = Boolean(ch.is_premium || ch.is_locked);
+            const isEarlyAccess = Boolean(ch.early_access_until && new Date(ch.early_access_until).getTime() > now);
+            const isLocked = isPremium || isEarlyAccess;
+
+            if (hidePremium && isLocked) {
+              continue;
+            }
+
+            const numFloat = parseFloat(ch.number) || 0;
+            const numStr = formatChapterNumber(numFloat);
+            const chapterSlug = ch.series_slug || resolvedSlug;
+            const chapterUrl = `/comics/${chapterSlug}/chapter/${numStr}`;
+
+            let name = "";
+            if (isLocked) name += "[Locked] ";
+            name += `Chapter ${numStr}`;
+            if (ch.title && ch.title.trim().length > 0) {
+              name += `: ${ch.title.trim()}`;
+            }
+
+            const dateUpload = ch.created_at ? (new Date(ch.created_at).getTime() || 0) : 0;
+
+            chapters.push({
+              url: chapterUrl,
+              name: name,
+              chapterNumber: numFloat,
+              dateUpload: dateUpload,
+              scanlator: isLocked ? "[Early Access]" : "Asura Scans",
+              isLocked: isLocked
+            });
+          }
+          return chapters;
+        }
+      }
+    } catch (_) {}
+
+    // 2. Secondary fallback: HTML scraping (Keiyoushi parity)
     let targetUrl = url.startsWith("http")
       ? url
       : `${this.baseUrl}/comics/${resolvedSlug}`;
@@ -458,8 +550,6 @@ const extension = {
     }
 
     const currentSlug = getCachedSlug(clean) || clean;
-    const now = Date.now();
-    const hidePremium = Boolean(options && (options.hidePremium || options.pref_hide_premium_chapters));
 
     const chapters = [];
     for (const ch of rawChapters) {
@@ -500,77 +590,76 @@ const extension = {
   },
 
   async getPages(chapterUrl) {
-    let fullUrl = chapterUrl.startsWith("http") ? chapterUrl : `${this.baseUrl}${chapterUrl.startsWith("/") ? "" : "/"}${chapterUrl}`;
-    let res = await this._fetch(fullUrl);
+    const pathSegments = chapterUrl.replace(this.baseUrl, "").split("/").filter(Boolean);
+    // /comics/{mangaSlug}/chapter/{chapterNumber}
+    const comicsIdx = pathSegments.indexOf("comics");
+    const mangaSlug = comicsIdx !== -1 && pathSegments[comicsIdx + 1] ? pathSegments[comicsIdx + 1] : "";
+    const chapterIdx = pathSegments.indexOf("chapter");
+    const chapterNumber = chapterIdx !== -1 && pathSegments[chapterIdx + 1] ? pathSegments[chapterIdx + 1] : "";
 
-    // Slug drift 404 recovery
-    if (!res.ok && URL_RANDOM_PART.test(fullUrl)) {
-      const fallbackUrl = fullUrl.replace(URL_RANDOM_PART, "");
-      const retryRes = await this._fetch(fallbackUrl);
-      if (retryRes.ok) {
-        res = retryRes;
-        fullUrl = fallbackUrl;
-      }
-    }
+    let pages = [];
 
-    if (!res.ok) return [];
-
-    const html = await res.text();
-    const data = extractAstroData(html, "pages");
-    let pages = (data && data.pages) ? data.pages : [];
-
-    // Authenticated / Token fallback for locked or reader-protected chapters (Keiyoushi auth parity)
-    if (pages.length === 0) {
+    // 1. Primary: JSON REST API (matches Keiyoushi tokenized endpoint)
+    if (mangaSlug && chapterNumber) {
       try {
-        const pageTokenMatch = html.match(PAGE_TOKEN_REGEX) || html.match(/"pageToken":\s*"([^"]+)"/);
-        const pageToken = pageTokenMatch ? pageTokenMatch[1] : "asura-reader-2026";
+        const apiUrl = `${this.apiUrl}/series/${mangaSlug}/chapters/${chapterNumber}`;
+        const headers = { "X-Page-Token": "asura-reader-2026" };
 
-        const pathSegments = fullUrl.replace(this.baseUrl, "").split("/").filter(Boolean);
-        // /comics/{mangaSlug}/chapter/{chapterNumber}
-        const comicsIdx = pathSegments.indexOf("comics");
-        const mangaSlug = comicsIdx !== -1 && pathSegments[comicsIdx + 1] ? pathSegments[comicsIdx + 1] : "";
-        const chapterIdx = pathSegments.indexOf("chapter");
-        const chapterNumber = chapterIdx !== -1 && pathSegments[chapterIdx + 1] ? pathSegments[chapterIdx + 1] : "";
-
-        if (mangaSlug && chapterNumber) {
-          const apiUrl = `${this.apiUrl}/series/${mangaSlug}/chapters/${chapterNumber}`;
-          const headers = { "X-Page-Token": pageToken };
-
-          // Extract access_token from cookies or storage if authenticated
-          let accessToken = "";
-          try {
-            if (typeof dokuha !== 'undefined' && typeof dokuha.getCookies === 'function') {
-              const cookies = dokuha.getCookies(this.baseUrl) || "";
-              const m = cookies.match(/access_token=([^;]+)/);
-              if (m) accessToken = m[1];
-            }
-            if (!accessToken && typeof dokuha !== 'undefined' && dokuha.storage && typeof dokuha.storage.getString === 'function') {
-              accessToken = dokuha.storage.getString("access_token", "");
-            }
-          } catch (_) {}
-
-          if (accessToken) {
-            headers["Authorization"] = `Bearer ${accessToken}`;
+        let accessToken = "";
+        try {
+          if (typeof dokuha !== 'undefined' && typeof dokuha.getCookies === 'function') {
+            const cookies = dokuha.getCookies(this.baseUrl) || "";
+            const m = cookies.match(/access_token=([^;]+)/);
+            if (m) accessToken = m[1];
           }
+          if (!accessToken && typeof dokuha !== 'undefined' && dokuha.storage && typeof dokuha.storage.getString === 'function') {
+            accessToken = dokuha.storage.getString("access_token", "");
+          }
+        } catch (_) {}
 
-          const apiRes = await this._fetch(apiUrl, { headers });
-          if (apiRes.ok) {
-            const apiJson = await apiRes.json();
-            if (apiJson && apiJson.data && apiJson.data.chapter && Array.isArray(apiJson.data.chapter.pages)) {
-              pages = apiJson.data.chapter.pages;
-            }
+        if (accessToken) {
+          headers["Authorization"] = `Bearer ${accessToken}`;
+        }
+
+        const apiRes = await this._fetch(apiUrl, { headers });
+        if (apiRes.ok) {
+          const apiJson = await apiRes.json();
+          if (apiJson && apiJson.data && apiJson.data.chapter && Array.isArray(apiJson.data.chapter.pages)) {
+            pages = apiJson.data.chapter.pages;
           }
         }
       } catch (_) {}
     }
 
-    // Fallback regex if still empty
+    // 2. Secondary fallback: HTML scraping (Keiyoushi parity)
     if (pages.length === 0) {
-      const match = html.match(/"pages":\s*(\[[^\]]+\])/);
-      if (match && match[1]) {
-        try {
-          pages = JSON.parse(match[1]);
-        } catch (_) {}
+      let fullUrl = chapterUrl.startsWith("http") ? chapterUrl : `${this.baseUrl}${chapterUrl.startsWith("/") ? "" : "/"}${chapterUrl}`;
+      let res = await this._fetch(fullUrl);
+
+      // Slug drift 404 recovery
+      if (!res.ok && URL_RANDOM_PART.test(fullUrl)) {
+        const fallbackUrl = fullUrl.replace(URL_RANDOM_PART, "");
+        const retryRes = await this._fetch(fallbackUrl);
+        if (retryRes.ok) {
+          res = retryRes;
+          fullUrl = fallbackUrl;
+        }
+      }
+
+      if (res.ok) {
+        const html = await res.text();
+        const data = extractAstroData(html, "pages");
+        pages = (data && data.pages) ? data.pages : [];
+
+        // Fallback regex if still empty
+        if (pages.length === 0) {
+          const match = html.match(/"pages":\s*(\[[^\]]+\])/);
+          if (match && match[1]) {
+            try {
+              pages = JSON.parse(match[1]);
+            } catch (_) {}
+          }
+        }
       }
     }
 
@@ -594,7 +683,11 @@ const extension = {
       const item = {
         index: idx,
         url: finalUrl,
-        imageUrl: finalUrl
+        imageUrl: finalUrl,
+        headers: {
+          "Referer": "https://asurascans.com/",
+          "User-Agent": this._headers()["User-Agent"]
+        }
       };
       if (tileData) {
         item.tiles = tileData.tiles;
